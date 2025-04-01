@@ -133,60 +133,33 @@ ensure_sshd_config() {
   fi
 }
 
-# 简单验证公钥格式
+# 简单检查公钥的基本格式
 # 返回0表示基本格式正确，非0表示格式错误
-check_ssh_public_key() {
+check_ssh_public_key_basic() {
   local key="$1"
-  local key_type key_data key_comment
   
-  # 分解公钥为类型、数据和注释（如果有）
-  read -r key_type key_data key_comment <<< "$key"
-  
-  # 1. 检查密钥类型 (基本格式验证)
-  if ! echo "$key_type" | grep -Eq '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)$'; then
+  # 检查是否以标准SSH密钥类型开头
+  if ! echo "$key" | grep -q -E '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)'; then
     return 1
   fi
   
-  # 2. 检查key_data是否非空
-  if [[ -z "$key_data" ]]; then
+  # 检查公钥是否包含至少两部分（类型和数据）
+  if [[ $(echo "$key" | wc -w) -lt 2 ]]; then
     return 1
   fi
-  
-  # 3. 检查是否有可疑的命令注入字符
-  if echo "$key" | grep -qE '(;|&&|\|\||`|\$\(|\{\{)'; then
-    return 1
-  }
   
   return 0
 }
 
-# 分析公钥并给出建议，但不阻止继续
-analyze_ssh_public_key() {
+# 显示公钥信息（如果系统支持）
+show_key_info() {
   local key="$1"
-  local key_type key_data
   
-  read -r key_type key_data _ <<< "$key"
-  
-  # 如果可用，使用ssh-keygen显示密钥信息
   if command -v ssh-keygen &>/dev/null; then
     echo "公钥信息:"
-    if ! key_info=$(ssh-keygen -lf - <<< "$key" 2>/dev/null); then
-      log_warning "无法使用ssh-keygen分析此密钥，但将继续使用。"
-    else
-      echo "$key_info"
-      
-      # 检查RSA密钥长度
-      if [[ "$key_type" == "ssh-rsa" ]]; then
-        local bits=$(echo "$key_info" | awk '{print $1}')
-        if [[ -n "$bits" && "$bits" -lt 2048 ]]; then
-          log_warning "检测到较短的RSA密钥 ($bits 位)。建议使用至少3072位的RSA密钥或改用ED25519密钥以提高安全性。"
-        elif [[ -n "$bits" && "$bits" -lt 3072 ]]; then
-          log_warning "检测到RSA密钥长度为 $bits 位。虽然已足够使用，但现代安全标准推荐使用至少3072位的RSA密钥或ED25519密钥。"
-        fi
-      fi
+    if ! ssh-keygen -lf - <<< "$key" 2>/dev/null; then
+      log_warning "无法使用ssh-keygen显示公钥信息，但这不影响安装过程。"
     fi
-  else
-    log_info "系统中未找到ssh-keygen工具，无法验证密钥强度。"
   fi
 }
 
@@ -340,7 +313,7 @@ if [[ ! -d "$USER_HOME" ]]; then
 fi
 log_info "将为用户 '$TARGET_USER' (家目录: $USER_HOME) 配置 SSH 密钥。"
 
-# 3. 提示用户粘贴公钥并进行基本验证
+# 3. 提示用户粘贴公钥并进行简单验证
 echo "请粘贴用户 '$TARGET_USER' 的 SSH 公钥 (以 ssh-rsa, ssh-ed25519, ecdsa-sha2-nistp... 开头)"
 read -p "> " PUBLIC_KEY
 
@@ -349,17 +322,16 @@ if [[ -z "$PUBLIC_KEY" ]]; then
   error_exit "公钥不能为空。"
 fi
 
-# 应用基本格式验证
-if ! check_ssh_public_key "$PUBLIC_KEY"; then
-  log_warning "公钥格式似乎不正确。请确保它以 ssh-rsa, ssh-ed25519 等开头，并包含有效数据。"
+# 简单的格式检查
+if ! check_ssh_public_key_basic "$PUBLIC_KEY"; then
+  log_warning "公钥格式可能不正确。请确保它以 ssh-rsa, ssh-ed25519 等开头，并包含数据部分。"
   read -p "是否继续使用此公钥? (y/n): " CONTINUE
   if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
     error_exit "已取消操作。"
   fi
-  log_info "将继续使用提供的公钥，但请注意它可能无法正常工作。"
 else
-  # 分析公钥并给出建议
-  analyze_ssh_public_key "$PUBLIC_KEY"
+  # 尝试显示公钥信息
+  show_key_info "$PUBLIC_KEY"
 fi
 
 # 4. 创建 .ssh 目录并设置权限
