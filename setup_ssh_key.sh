@@ -15,13 +15,6 @@ BACKUP_SUFFIX=".bak-$(date +%Y%m%d_%H%M%S)"
 MIN_PORT=10000
 MAX_PORT=65000
 
-# RSA 密钥最小长度（位）
-MIN_RSA_KEY_LENGTH=3072
-# ED25519 密钥最小长度（字节）- 通常固定为 32 字节
-MIN_ED25519_KEY_LENGTH=32
-# ECDSA 密钥最小长度（字节）
-MIN_ECDSA_KEY_LENGTH=32
-
 # --- 函数定义 ---
 
 # 输出错误信息并退出
@@ -140,88 +133,60 @@ ensure_sshd_config() {
   fi
 }
 
-# 验证公钥格式
-# 返回0表示有效，非0表示无效
-validate_ssh_public_key() {
+# 简单验证公钥格式
+# 返回0表示基本格式正确，非0表示格式错误
+check_ssh_public_key() {
   local key="$1"
   local key_type key_data key_comment
   
   # 分解公钥为类型、数据和注释（如果有）
   read -r key_type key_data key_comment <<< "$key"
   
-  # 1. 检查密钥类型
+  # 1. 检查密钥类型 (基本格式验证)
   if ! echo "$key_type" | grep -Eq '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)$'; then
-    log_warning "无效的密钥类型: $key_type"
     return 1
   fi
   
-  # 2. 检查key_data是否为有效的base64编码
-  if ! echo "$key_data" | grep -Eq '^[A-Za-z0-9+/]+={0,3}$'; then
-    log_warning "公钥数据部分不是有效的Base64编码"
+  # 2. 检查key_data是否非空
+  if [[ -z "$key_data" ]]; then
     return 1
   fi
   
-  # 3. 解码key_data并检查长度
-  local decoded_key
-  decoded_key=$(echo "$key_data" | base64 -d 2>/dev/null | xxd -p 2>/dev/null || echo "")
-  
-  if [[ -z "$decoded_key" ]]; then
-    log_warning "无法解码公钥数据部分"
-    return 1
-  fi
-  
-  # 4. 根据密钥类型检查长度
-  local key_length_bytes=$((${#decoded_key} / 2))
-  
-  case "$key_type" in
-    "ssh-rsa")
-      # 对于RSA，解码后的数据包含多个ASN.1字段，这里的检查是近似的
-      # 实际RSA密钥长度约为解码后长度的1/8（粗略估计）
-      local approx_bit_length=$((key_length_bytes * 8 / 10))
-      if [[ "$approx_bit_length" -lt "$MIN_RSA_KEY_LENGTH" ]]; then
-        log_warning "RSA密钥长度太短: 约 ${approx_bit_length} 位，最小要求 ${MIN_RSA_KEY_LENGTH} 位"
-        return 1
-      fi
-      ;;
-    "ssh-ed25519")
-      # Ed25519密钥有固定长度，通常解码后约64字节
-      if [[ "$key_length_bytes" -lt "$MIN_ED25519_KEY_LENGTH" ]]; then
-        log_warning "Ed25519密钥长度异常: ${key_length_bytes} 字节"
-        return 1
-      fi
-      ;;
-    "ecdsa-sha2-nistp"*)
-      if [[ "$key_length_bytes" -lt "$MIN_ECDSA_KEY_LENGTH" ]]; then
-        log_warning "ECDSA密钥长度异常: ${key_length_bytes} 字节"
-        return 1
-      fi
-      ;;
-  esac
-  
-  # 5. 检查密钥中是否包含可疑模式（例如命令注入）
+  # 3. 检查是否有可疑的命令注入字符
   if echo "$key" | grep -qE '(;|&&|\|\||`|\$\(|\{\{)'; then
-    log_warning "公钥中包含可疑字符，可能尝试命令注入"
     return 1
-  fi
-  
-  # 6. 尝试使用ssh-keygen验证（如果系统支持）
-  if command -v ssh-keygen &>/dev/null; then
-    if ! echo "$key" | ssh-keygen -lf - &>/dev/null; then
-      log_warning "ssh-keygen无法验证此密钥"
-      return 1
-    fi
-  fi
+  }
   
   return 0
 }
 
-# 获取和显示公钥的详细信息
-show_key_info() {
+# 分析公钥并给出建议，但不阻止继续
+analyze_ssh_public_key() {
   local key="$1"
+  local key_type key_data
   
+  read -r key_type key_data _ <<< "$key"
+  
+  # 如果可用，使用ssh-keygen显示密钥信息
   if command -v ssh-keygen &>/dev/null; then
     echo "公钥信息:"
-    echo "$key" | ssh-keygen -lf - || log_warning "无法获取公钥信息"
+    if ! key_info=$(ssh-keygen -lf - <<< "$key" 2>/dev/null); then
+      log_warning "无法使用ssh-keygen分析此密钥，但将继续使用。"
+    else
+      echo "$key_info"
+      
+      # 检查RSA密钥长度
+      if [[ "$key_type" == "ssh-rsa" ]]; then
+        local bits=$(echo "$key_info" | awk '{print $1}')
+        if [[ -n "$bits" && "$bits" -lt 2048 ]]; then
+          log_warning "检测到较短的RSA密钥 ($bits 位)。建议使用至少3072位的RSA密钥或改用ED25519密钥以提高安全性。"
+        elif [[ -n "$bits" && "$bits" -lt 3072 ]]; then
+          log_warning "检测到RSA密钥长度为 $bits 位。虽然已足够使用，但现代安全标准推荐使用至少3072位的RSA密钥或ED25519密钥。"
+        fi
+      fi
+    fi
+  else
+    log_info "系统中未找到ssh-keygen工具，无法验证密钥强度。"
   fi
 }
 
@@ -375,10 +340,8 @@ if [[ ! -d "$USER_HOME" ]]; then
 fi
 log_info "将为用户 '$TARGET_USER' (家目录: $USER_HOME) 配置 SSH 密钥。"
 
-
-# 3. 提示用户粘贴公钥并进行严格验证
+# 3. 提示用户粘贴公钥并进行基本验证
 echo "请粘贴用户 '$TARGET_USER' 的 SSH 公钥 (以 ssh-rsa, ssh-ed25519, ecdsa-sha2-nistp... 开头)"
-echo "支持的密钥类型: ssh-rsa (>=3072位), ssh-ed25519, ecdsa-sha2-nistp256/384/521"
 read -p "> " PUBLIC_KEY
 
 # 验证公钥是否为空
@@ -386,13 +349,18 @@ if [[ -z "$PUBLIC_KEY" ]]; then
   error_exit "公钥不能为空。"
 fi
 
-# 应用严格验证
-if ! validate_ssh_public_key "$PUBLIC_KEY"; then
-  error_exit "公钥未通过严格验证。请检查格式或使用更强的密钥类型和长度。"
+# 应用基本格式验证
+if ! check_ssh_public_key "$PUBLIC_KEY"; then
+  log_warning "公钥格式似乎不正确。请确保它以 ssh-rsa, ssh-ed25519 等开头，并包含有效数据。"
+  read -p "是否继续使用此公钥? (y/n): " CONTINUE
+  if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+    error_exit "已取消操作。"
+  fi
+  log_info "将继续使用提供的公钥，但请注意它可能无法正常工作。"
+else
+  # 分析公钥并给出建议
+  analyze_ssh_public_key "$PUBLIC_KEY"
 fi
-
-# 显示公钥信息
-show_key_info "$PUBLIC_KEY"
 
 # 4. 创建 .ssh 目录并设置权限
 SSH_DIR="$USER_HOME/.ssh"
@@ -494,14 +462,7 @@ else
 fi
 log_info "SSH 服务已重启，现在使用端口 $NEW_SSH_PORT。"
 
-# 12. 监控SSH登录尝试
-log_info "正在监控SSH登录尝试..."
-if command -v grep &>/dev/null && command -v journalctl &>/dev/null; then
-  echo "最近的SSH登录尝试:"
-  journalctl -u sshd --since "1 hour ago" -n 10 2>/dev/null || grep "sshd" /var/log/auth.log 2>/dev/null || grep "sshd" /var/log/secure 2>/dev/null || echo "无法获取SSH日志，请手动检查系统日志。"
-fi
-
-# 13. 输出最终信息
+# 12. 输出最终信息
 echo ""
 log_info "SSH 密钥登录已为用户 '$TARGET_USER' 配置完成:"
 log_info "1. 密码登录已禁用"
